@@ -1,5 +1,5 @@
 # petronect_scraper.py
-import asyncio, re, time
+import asyncio, re, time, subprocess, sys
 from datetime import datetime, timezone
 import pandas as pd
 from pathlib import Path
@@ -11,7 +11,7 @@ PETRONECT_PUBLIC_URL = "https://www.petronect.com.br/irj/go/km/docs/pccshrconten
 KEYWORDS = [
     "API 610",
     "bomba centrífuga","bomba","bombas","Aquisição de bombas centrífugas","bomba centrífuga",
-    "OH1","OH-1","OH2","OH-2","OH3","OH-3","OH4","OH-4","OH5","OH-5","OH6","OH-6","OHH", 
+    "OH1","OH-1","OH2","OH-2","OH3","OH-3","OH4","OH-4","OH5","OH-5","OH6","OH-6","OHH",
     "BB1","BB-1","BB2","BB-2","BB3","BB-3","BB4","BB-4","BB5","BB-5",
     "overhung","between bearings","entre mancais","axial split","radial split"
 ]
@@ -19,39 +19,57 @@ KEYWORDS = [
 OUTPUT_DIR = Path("saida_petronect")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+
 def matches_pump_scope(text: str) -> bool:
     txt = text.lower()
     return any(k.lower() in txt for k in KEYWORDS)
 
+
+def ensure_browsers_installed():
+    """
+    Em ambiente como o Streamlit Cloud não dá para rodar 'playwright install' no terminal.
+    Então chamamos aqui via subprocess. Se já estiver instalado, o comando sai rápido.
+    """
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # se der erro aqui, deixamos o Playwright se virar e mostrar mensagem normal
+        pass
+
+
 async def scrape_once():
+    # garante que o Chromium do Playwright existe
+    ensure_browsers_installed()
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, slow_mo=50)
-        #browser = await p.chromium.launch(headless=True)
+        # em servidor, sempre headless
+        browser = await p.chromium.launch(headless=True)
+        # se quiser testar local vendo o navegador, mude para headless=False
 
         context = await browser.new_context(locale="pt-BR")
         page = await context.new_page()
         await page.goto(PETRONECT_PUBLIC_URL, wait_until="domcontentloaded")
 
-        # A página é dinâmica; espere os controles aparecerem
-        # e tente capturar a tabela “Lista de Publicações”.
-        # Observação: seletores podem precisar ajustes finos conforme o HTML real no dia.
-        # Estratégia: busque linhas de tabela visíveis e pagine com “Próximo”.
         all_rows = []
 
         def normalize_spaces(s: str) -> str:
             return re.sub(r"\s+", " ", s or "").strip()
 
-        # Tente múltiplas iterações de paginação (limite defensivo p/ não travar)
-        for _ in range(35):
+        # Tente múltiplas iterações de paginação (limite defensivo)
+        for _ in range(40):
             # Coletar linhas visíveis (ajuste o seletor conforme necessário)
-            # Aqui pegamos qualquer tabela com cabeçalhos “Número / Objeto / ...”
             rows = await page.locator("table >> tr").all()
             for r in rows:
                 cells = await r.locator("td,th").all_inner_texts()
                 if len(cells) < 3:
                     continue
                 row_text = " | ".join(normalize_spaces(c) for c in cells)
-                if not row_text or "Número" in row_text and "Objeto" in row_text:
+                if not row_text or ("Número" in row_text and "Objeto" in row_text):
                     continue
                 # Filtrar por escopo API 610 bombas
                 if matches_pump_scope(row_text):
@@ -67,14 +85,9 @@ async def scrape_once():
             disabled = await next_btn.evaluate_handle("el => el.getAttribute('disabled')")
             if disabled and (await disabled.json_value()) is not None:
                 break
-            # rola até o botão e clica
             await next_btn.scroll_into_view_if_needed()
             await next_btn.click()
             await page.wait_for_timeout(1200)  # pequeno atraso para carregar
-
-        # Se também houver página de detalhes (modal/painel), você pode clicar em cada linha
-        # e extrair campos específicos: Número, Objeto, Empresa, Data início/fim etc.
-        # (Isso exige inspecionar seletores reais em execução.)
 
         # Salvar resultados
         ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%Hh%M")
@@ -86,6 +99,7 @@ async def scrape_once():
         print(f"Salvo:\n- {csv_path}\n- {xlsx_path}")
 
         await browser.close()
+
 
 if __name__ == "__main__":
     asyncio.run(scrape_once())
